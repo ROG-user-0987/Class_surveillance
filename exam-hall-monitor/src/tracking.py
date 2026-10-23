@@ -11,11 +11,15 @@ What happens to every processed frame:
          c) nobody (the phone stays "unassigned").
     4. One FrameRecord per tracked person is produced. These records are the
        ONLY thing later modules (pose_rules.py, risk.py) consume.
+    5. VideoScan feeds the records to risk.RiskScorer, which raises Alerts
+       (flags for HUMAN review) when a behaviour lasts long enough, and saves
+       a short review clip for each one.
 
 VideoScan runs this over a whole video one frame at a time, so a viewer
 (src/live.py, app.py) can show each annotated frame as soon as it is ready.
 
-Nothing here decides whether anyone is cheating. It only measures.
+Nothing here decides whether anyone is cheating. It measures and flags; a
+person decides.
 
 Run on its own (no live view, just saves the annotated video):
     python -m src.tracking --video data/sample.mp4
@@ -24,25 +28,32 @@ Run on its own (no live view, just saves the annotated video):
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import time
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
 
+from src.risk import Alert, RiskScorer, format_alert, save_alerts_csv
+from src.seat_count import load_zones
 from src.utils import (
     PHONE_COLOR,
+    TIER_COLORS,
     UNASSIGNED_COLOR,
     WRIST_KEYPOINTS,
+    ZONE_COLOR,
+    ClipRecorder,
     blur_head,
     color_for_id,
     draw_box,
     draw_footer,
     draw_header,
     draw_line,
+    draw_polygon,
     draw_skeleton,
     get_video_info,
     load_config,
@@ -137,6 +148,7 @@ class LiveFrame:
     annotated: np.ndarray  # BGR image, heads already blurred, safe to show
     output: FrameOutput
     progress: float        # 0.0 .. 1.0 through the video
+    new_alerts: list[Alert]  # alerts that fired on this frame (usually empty)
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +286,18 @@ def pick_device(setting: Any) -> str:
     return "0" if torch.cuda.is_available() else "cpu"
 
 
+def prepare_runtime(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of cfg with runtime.device resolved ("auto" -> "0" or
+    "cpu"). On CPU, runtime.cpu_overrides (fewer frames, smaller images) are
+    applied so the pipeline stays usable without a GPU."""
+    cfg = copy.deepcopy(cfg)
+    runtime = cfg["runtime"]
+    runtime["device"] = pick_device(runtime["device"])
+    if runtime["device"] == "cpu":
+        runtime.update(runtime.get("cpu_overrides") or {})
+    return cfg
+
+
 class ExamHallTracker:
     """Loads both models once, then processes frames one at a time.
 
@@ -287,8 +311,10 @@ class ExamHallTracker:
         from ultralytics import YOLO
 
         self.cfg = cfg
-        self.device = pick_device(cfg["runtime"]["device"])
-        print(f"Device: {'GPU ' + self.device if self.device != 'cpu' else 'CPU'}")
+        runtime = cfg["runtime"]
+        self.device = pick_device(runtime["device"])
+        print(f"Device: {'GPU ' + self.device if self.device != 'cpu' else 'CPU'} | "
+              f"every {runtime['every_nth_frame']} frame(s) | image size {runtime['imgsz']}")
 
         paths = cfg["paths"]
         self.pose_model = YOLO(str(resolve_path(paths["pose_weights"])))
@@ -380,10 +406,20 @@ class ExamHallTracker:
 # Drawing
 # ---------------------------------------------------------------------------
 
-def draw_frame(frame: np.ndarray, output: FrameOutput, cfg: dict[str, Any]) -> np.ndarray:
-    """Return an annotated copy of `frame` (heads blurred FIRST)."""
+def draw_frame(
+    frame: np.ndarray,
+    output: FrameOutput,
+    cfg: dict[str, Any],
+    flags: dict[int, list[tuple[str, str]]] | None = None,
+) -> np.ndarray:
+    """Return an annotated copy of `frame` (heads blurred FIRST).
+
+    `flags` comes from RiskScorer.active_flags(): people listed there get a
+    thick red/orange box and a "REVIEW: ..." label.
+    """
     canvas = frame.copy()
     privacy = cfg["privacy"]
+    flags = flags or {}
 
     # 1. Blur every detected person's head, including people without a
     #    track_id yet, before drawing anything else.
@@ -400,17 +436,28 @@ def draw_frame(frame: np.ndarray, output: FrameOutput, cfg: dict[str, Any]) -> n
                 person_box=person.box,
             )
 
-    # 2. People: skeleton, box and track ID.
+    # 2. Seat zones (thin outlines), if any are configured.
+    for zone_id, polygon in load_zones(cfg):
+        draw_polygon(canvas, polygon, ZONE_COLOR, zone_id)
+
+    # 3. People: skeleton, box and track ID. Flagged people get a thick
+    #    red/orange box saying what to review.
     person_centres: dict[int, tuple[float, float]] = {}
     for person in output.people:
         color = color_for_id(person.track_id)
         draw_skeleton(canvas, person.keypoints, color, cfg["pose"]["keypoint_conf"])
         label = f"ID {person.track_id}" if person.track_id is not None else "ID ?"
-        draw_box(canvas, person.box, color, label)
+        person_flags = flags.get(person.track_id, [])
+        if person_flags:
+            tier = "red" if any(t == "red" for t, _ in person_flags) else "orange"
+            label += " REVIEW: " + ", ".join(text for _, text in person_flags)
+            draw_box(canvas, person.box, TIER_COLORS[tier], label, thickness=4)
+        else:
+            draw_box(canvas, person.box, color, label)
         if person.track_id is not None:
             person_centres[person.track_id] = box_centre(person.box)
 
-    # 3. Phones, with a line from each assigned phone to its person.
+    # 4. Phones, with a line from each assigned phone to its person.
     for phone, owner in zip(output.phones, output.assignments):
         if owner is None:
             draw_box(canvas, phone.box, UNASSIGNED_COLOR, f"phone {phone.conf:.2f} unassigned")
@@ -418,12 +465,13 @@ def draw_frame(frame: np.ndarray, output: FrameOutput, cfg: dict[str, Any]) -> n
             draw_box(canvas, phone.box, PHONE_COLOR, f"phone {phone.conf:.2f} -> ID {owner}")
             draw_line(canvas, box_centre(phone.box), person_centres[owner], PHONE_COLOR)
 
-    # 4. Status line at the top: video time and what is visible right now.
+    # 5. Status line at the top: video time and what is visible right now.
     minutes, seconds = divmod(int(output.timestamp), 60)
-    header = f"{minutes:02d}:{seconds:02d}  people: {len(output.people)}  phones: {len(output.phones)}"
-    near = sorted({owner for owner in output.assignments if owner is not None})
-    if near:
-        header += "  (phone near ID " + ", ".join(str(i) for i in near) + ")"
+    people = f"{len(output.people)}"
+    if cfg["seats"]["expected_count"]:
+        people += f"/{cfg['seats']['expected_count']}"
+    header = (f"{minutes:02d}:{seconds:02d}  people: {people}  phones: {len(output.phones)}"
+              f"  flagged now: {len(flags)}")
     draw_header(canvas, header)
 
     draw_footer(canvas, "Detections are for human review only")
@@ -434,13 +482,20 @@ def draw_frame(frame: np.ndarray, output: FrameOutput, cfg: dict[str, Any]) -> n
 # Whole-video scan, one frame at a time
 # ---------------------------------------------------------------------------
 
+def clip_name(alert: Alert) -> str:
+    """File name (without .mp4) for an alert's review clip, e.g. 01m23s_ID4_phone."""
+    minutes, seconds = divmod(int(alert.timestamp), 60)
+    return f"{minutes:02d}m{seconds:02d}s_ID{alert.track_id}_{alert.behaviour}"
+
+
 class VideoScan:
-    """Scan one video frame by frame, saving the annotated copy as it goes.
+    """Scan one video frame by frame: detect, score, save the annotated copy,
+    review clips and an alerts CSV as it goes.
 
     Usage:
         scan = VideoScan(video_path, cfg)
         with closing(scan.frames()) as frames:   # closing() makes sure the
-            for live in frames:                   # output file is finished
+            for live in frames:                   # output files are finished
                 show(live.annotated)              # even if you stop early
         print(scan.summary())
     """
@@ -449,15 +504,23 @@ class VideoScan:
         self, video_path: str | Path, cfg: dict[str, Any], output_path: str | Path | None = None
     ) -> None:
         self.video_path = Path(video_path)
-        self.cfg = cfg
+        self.cfg = cfg = prepare_runtime(cfg)  # resolves GPU/CPU, applies CPU settings
         self.every_nth = int(cfg["runtime"]["every_nth_frame"])
         self.info = get_video_info(self.video_path, cfg["runtime"]["fallback_fps"])
         if output_path is None:
             output_path = resolve_path(cfg["paths"]["output_dir"]) / f"{self.video_path.stem}_tracked.mp4"
         self.output_path = Path(output_path)
+
+        # Alerts CSV and clips are named after the output video.
+        name = self.output_path.stem.removesuffix("_tracked")
+        self.alerts_csv = self.output_path.with_name(f"{name}_alerts.csv")
+        self.clips_dir = self.output_path.parent / "clips" / name
+
         self.tracker = ExamHallTracker(cfg)
+        self.risk = RiskScorer(cfg)
 
         # Running totals, used for the summary.
+        self.alerts: list[Alert] = []
         self.frames_processed = 0
         self.track_ids: set[int] = set()
         self.phone_detections = 0
@@ -468,6 +531,12 @@ class VideoScan:
         """Yield each processed frame as soon as it is ready."""
         fps_out = self.info["fps"] / self.every_nth  # saved video plays at real-time speed
         writer = make_video_writer(self.output_path, fps_out, self.info["width"], self.info["height"])
+        alerts_cfg, live_cfg = self.cfg["alerts"], self.cfg["live"]
+        clips = None
+        if alerts_cfg["save_clips"]:
+            clips = ClipRecorder(self.clips_dir, fps_out, alerts_cfg["clip_before_s"],
+                                 alerts_cfg["clip_after_s"], live_cfg["display_width"],
+                                 live_cfg["jpeg_quality"])
         expected = max(self.info["frame_count"] // self.every_nth, 1)
         start = time.time()
 
@@ -476,8 +545,15 @@ class VideoScan:
                 self.video_path, self.every_nth, self.cfg["runtime"]["fallback_fps"]
             ):
                 output = self.tracker.process_frame(frame_index, timestamp, frame)
-                annotated = draw_frame(frame, output, self.cfg)
+                new_alerts = self.risk.update(timestamp, output.records)
+                annotated = draw_frame(frame, output, self.cfg, flags=self.risk.active_flags())
                 writer.write(annotated)
+
+                if clips is not None:
+                    clips.add_frame(annotated)
+                    new_alerts = [replace(a, clip_path=str(clips.start_clip(clip_name(a))))
+                                  for a in new_alerts]
+                self.alerts.extend(new_alerts)
 
                 self.frames_processed += 1
                 self.track_ids.update(r.track_id for r in output.records)
@@ -491,15 +567,22 @@ class VideoScan:
                     annotated=annotated,
                     output=output,
                     progress=min(self.frames_processed / expected, 1.0),
+                    new_alerts=new_alerts,
                 )
         finally:
-            writer.release()  # always finish the file, even if the viewer stops early
+            # Always finish the files, even if the viewer stops early.
+            writer.release()
+            if clips is not None:
+                clips.close()
+            save_alerts_csv(self.alerts, self.alerts_csv)
 
     def summary(self) -> dict[str, Any]:
         """Totals so far (call after frames() has finished or been stopped)."""
         return {
             "video": str(self.video_path),
             "output": str(self.output_path),
+            "device": self.cfg["runtime"]["device"],
+            "video_fps": self.info["fps"],
             "frames_total": self.info["frame_count"],
             "every_nth": self.every_nth,
             "frames_processed": self.frames_processed,
@@ -507,6 +590,11 @@ class VideoScan:
             "phone_detections": self.phone_detections,
             "phones_assigned": self.phones_assigned,
             "phones_unassigned": self.phone_detections - self.phones_assigned,
+            "alerts": list(self.alerts),
+            "alerts_red": sum(a.tier == "red" for a in self.alerts),
+            "alerts_orange": sum(a.tier == "orange" for a in self.alerts),
+            "alerts_csv": str(self.alerts_csv),
+            "clips_dir": str(self.clips_dir),
             "seconds": self.seconds,
             "fps": self.frames_processed / self.seconds if self.seconds > 0 else 0.0,
         }
@@ -523,6 +611,8 @@ def run_on_video(
     with closing(scan.frames()) as frames:
         for live in frames:
             all_records.extend(live.output.records)
+            for alert in live.new_alerts:
+                print(f"  FLAG {format_alert(alert)}")
             if scan.frames_processed % cfg["runtime"]["log_every"] == 0:
                 print(f"  processed {scan.frames_processed}/~{expected} frames (t = {live.timestamp:.1f}s)")
 
@@ -540,9 +630,17 @@ def print_summary(summary: dict[str, Any]) -> None:
     print(f"Phone detections:  {summary['phone_detections']}")
     print(f"  assigned:        {summary['phones_assigned']}")
     print(f"  unassigned:      {summary['phones_unassigned']}")
-    print(f"Wall time:         {summary['seconds']:.0f}s "
+    print(f"Wall time:         {summary['seconds']:.0f}s on {summary['device']} "
           f"({summary['fps']:.1f} processed frames/s, including any live display)")
     print(f"Annotated video:   {summary['output']}")
+    print(f"\nFlags for HUMAN review: {len(summary['alerts'])} "
+          f"(red {summary['alerts_red']}, orange {summary['alerts_orange']})")
+    for alert in summary["alerts"]:
+        print(f"  {format_alert(alert)}")
+    if summary["alerts"]:
+        print(f"Alerts CSV:        {summary['alerts_csv']}")
+        print(f"Review clips:      {summary['clips_dir']}")
+    print("These are things to look at, not decisions. A person reviews every flag.")
 
 
 def main() -> None:

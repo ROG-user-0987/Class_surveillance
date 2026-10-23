@@ -58,10 +58,10 @@ Run everything from the repo root.
 | Live scan in an OpenCV window (needs a screen, q stops) | `python -m src.live --video data/sample.mp4` | done |
 | Live scan web app with upload button | `streamlit run app.py --server.maxUploadSize 1000` | done |
 | Live scan in a notebook | `play_in_notebook(video, cfg)`, see the Colab notebook | done |
+| Flags for review (scan + list alerts) | `python -m src.risk --video data/sample.mp4` | done |
+| Pose statistics per person (for tuning thresholds) | `python -m src.pose_rules --video data/sample.mp4` | done |
+| Time outside seat zones (needs `seats.zones`) | `python -m src.seat_count --video data/sample.mp4` | done |
 | Phone detector (SAHI) | `python -m src.detect_phone --video data/sample.mp4` | stub |
-| Pose rules | `python -m src.pose_rules --video data/sample.mp4` | stub |
-| Seat count | `python -m src.seat_count --video data/sample.mp4` | stub |
-| Risk scoring | `python -m src.risk --video data/sample.mp4` | interface only |
 | Evaluation | `python evaluate.py --video data/sample.mp4` | stub |
 
 `--video` can be left out if `paths.input_video` is set in `config.yaml`.
@@ -75,7 +75,36 @@ Run everything from the repo root.
   while they are being processed, plus a stats line (progress, speed vs real
   time).
 - A summary printed to the terminal: frames processed, unique track IDs,
-  phone detections, assigned vs unassigned.
+  phone detections, assigned vs unassigned, and the list of flags.
+- `results/<video name>_alerts.csv`: one row per flag, with an empty
+  `review_decision` column for the reviewer.
+- `results/clips/<video name>/`: a short clip around every flag (heads
+  blurred), e.g. `01m23s_ID4_phone.mp4`.
+
+### Flags for human review
+
+The system flags behaviours that are worth a look. It never decides that
+anyone cheated; a person reviews every flag.
+
+| Behaviour | Flagged when it lasts at least | Default tier |
+|---|---|---|
+| Phone near a person's hands | `phone.min_duration_s` (1 s) | red |
+| Head turned to the side | `pose.min_duration_s` (2 s) | orange |
+| Leaning (needs hips visible) | `pose.min_duration_s` (2 s) | orange |
+| Outside all seat zones (needs `seats.zones`) | `seats.max_outside_s` (10 s) | orange |
+
+Flagged people get a thick red/orange box with `REVIEW: ...` in the video.
+The same person + behaviour is not flagged again within `alerts.cooldown_s`.
+Before trusting the head-turn rule on a new camera, run
+`python -m src.pose_rules` on a normal clip and set
+`pose.head_turn_threshold` above what most people show when facing forward.
+
+### Running on CPU
+
+`runtime.device: auto` uses the GPU when PyTorch can see one, otherwise the
+CPU. On CPU, `runtime.cpu_overrides` applies (every 3rd frame, image size 480)
+to keep it usable. The live view then plays slower than real time; the
+stats line shows the speed (e.g. `0.4x real time`).
 
 ## Training (Colab)
 

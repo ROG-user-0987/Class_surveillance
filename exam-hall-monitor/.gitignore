@@ -6,8 +6,9 @@ data/*
 !data/.gitkeep
 
 # --- Outputs ----------------------------------------------------------------
-results/*.mp4
-results/*.avi
+results/**/*.mp4
+results/**/*.avi
+results/**/*.csv
 runs/
 
 # --- Model weights ----------------------------------------------------------

@@ -15,6 +15,8 @@ Run on its own to check that a video opens and the config loads:
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -28,7 +30,9 @@ DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
 
 # COCO keypoint indices produced by YOLOv8-Pose (17 points per person).
 NOSE, LEFT_EYE, RIGHT_EYE, LEFT_EAR, RIGHT_EAR = 0, 1, 2, 3, 4
+LEFT_SHOULDER, RIGHT_SHOULDER = 5, 6
 LEFT_WRIST, RIGHT_WRIST = 9, 10
+LEFT_HIP, RIGHT_HIP = 11, 12
 HEAD_KEYPOINTS = [NOSE, LEFT_EYE, RIGHT_EYE, LEFT_EAR, RIGHT_EAR]
 WRIST_KEYPOINTS = [LEFT_WRIST, RIGHT_WRIST]
 
@@ -44,6 +48,8 @@ SKELETON = [
 PHONE_COLOR = (255, 255, 0)        # cyan
 UNASSIGNED_COLOR = (160, 160, 160)  # grey
 TEXT_COLOR = (255, 255, 255)        # white
+ZONE_COLOR = (200, 200, 200)        # light grey seat outlines
+TIER_COLORS = {"red": (0, 0, 255), "orange": (0, 140, 255)}  # review priority colours
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +156,77 @@ def make_video_writer(
     return writer
 
 
+def resize_to_width(frame: np.ndarray, width: int) -> np.ndarray:
+    """Shrink a frame to `width` pixels wide, keeping its shape (never enlarges)."""
+    h, w = frame.shape[:2]
+    if w <= width:
+        return frame
+    return cv2.resize(frame, (width, int(h * width / w)), interpolation=cv2.INTER_AREA)
+
+
+@dataclass
+class _OpenClip:
+    writer: cv2.VideoWriter
+    frames_left: int
+
+
+class ClipRecorder:
+    """Saves a short clip around each alert for the human reviewer.
+
+    It keeps the last `before_s` seconds of frames in memory (as small JPEGs,
+    so memory stays low). When start_clip() is called, those frames are
+    written first, so the clip begins BEFORE the alert, and then the next
+    `after_s` seconds are added as they arrive.
+
+    Only pass frames that are already annotated with heads blurred.
+    """
+
+    def __init__(
+        self, folder: str | Path, fps: float, before_s: float, after_s: float,
+        width: int, jpeg_quality: int,
+    ) -> None:
+        self.folder = Path(folder)
+        self.fps = fps
+        self.width = width
+        self.jpeg_quality = jpeg_quality
+        self.recent: deque[np.ndarray] = deque(maxlen=max(1, round(before_s * fps)))
+        self.after_frames = max(1, round(after_s * fps))
+        self.open_clips: list[_OpenClip] = []
+
+    def add_frame(self, frame: np.ndarray) -> None:
+        """Call once per processed frame."""
+        small = resize_to_width(frame, self.width)
+
+        # Feed clips that are still recording their "after" part.
+        for clip in self.open_clips:
+            clip.writer.write(small)
+            clip.frames_left -= 1
+        for clip in [c for c in self.open_clips if c.frames_left <= 0]:
+            clip.writer.release()
+            self.open_clips.remove(clip)
+
+        ok, jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        if ok:
+            self.recent.append(jpg)
+
+    def start_clip(self, name: str) -> Path:
+        """Start a clip called <name>.mp4 (call right after add_frame)."""
+        frames = [cv2.imdecode(jpg, cv2.IMREAD_COLOR) for jpg in self.recent]
+        h, w = frames[-1].shape[:2]
+        path = self.folder / f"{name}.mp4"
+        writer = make_video_writer(path, self.fps, w, h)
+        for frame in frames:
+            writer.write(frame)
+        self.open_clips.append(_OpenClip(writer, self.after_frames))
+        return path
+
+    def close(self) -> None:
+        """Finish all clips (the last ones may be shorter if the video ended)."""
+        for clip in self.open_clips:
+            clip.writer.release()
+        self.open_clips.clear()
+
+
 # ---------------------------------------------------------------------------
 # Drawing
 # ---------------------------------------------------------------------------
@@ -173,10 +250,11 @@ def draw_box(
     box: np.ndarray,
     color: tuple[int, int, int],
     label: str | None = None,
+    thickness: int = 2,
 ) -> None:
     """Draw an [x1, y1, x2, y2] box with an optional label above it."""
     x1, y1, x2, y2 = (int(v) for v in box)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
     if label:
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         top = max(y1 - th - 6, 0)
@@ -209,6 +287,16 @@ def draw_line(
 ) -> None:
     """Draw a straight line between two (x, y) points."""
     cv2.line(frame, to_point(start), to_point(end), color, 2, cv2.LINE_AA)
+
+
+def draw_polygon(
+    frame: np.ndarray, polygon: np.ndarray, color: tuple[int, int, int], label: str
+) -> None:
+    """Draw a closed polygon outline (e.g. a seat zone) with a small label."""
+    points = polygon.astype(np.int32)
+    cv2.polylines(frame, [points], True, color, 1, cv2.LINE_AA)
+    cv2.putText(frame, label, (int(points[0][0]) + 3, int(points[0][1]) + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
 
 def _outlined_text(frame: np.ndarray, text: str, origin: tuple[int, int]) -> None:
