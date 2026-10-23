@@ -1,0 +1,58 @@
+# config.yaml: every threshold and path used by the project lives here.
+# Relative paths are relative to the repo root (the folder this file is in).
+# Changing a number here should never require editing a .py file.
+# Entries marked "(later)" are read by modules that are still stubs.
+
+paths:
+  input_video: null              # e.g. data/sample.mp4, or pass --video on the CLI
+  output_dir: results
+  pose_weights: yolov8n-pose.pt  # Ultralytics downloads it on first run
+  phone_weights: yolov8n.pt      # COCO model for now; swap in our fine-tuned best.pt later
+  tracker: bytetrack.yaml        # Ultralytics built-in ByteTrack config (or a path to your own)
+
+phone:
+  class_id: 67                   # COCO "cell phone". Set to 0 for the fine-tuned 1-class model.
+  conf_threshold: 0.25
+  min_duration_s: 1.0            # (later) phone must persist this long before it is flagged
+  sahi: false                    # (later) sliced inference for small, far-away phones
+  slice_size: 640                # (later) SAHI slice width/height in pixels
+  slice_overlap: 0.2             # (later) SAHI overlap ratio between slices
+
+association:                     # how a phone box is given to one person
+  keypoint_conf: 0.5             # ignore wrist keypoints below this confidence
+  max_wrist_distance: 0.35       # phone centre to wrist, as a fraction of that person's box height
+  min_box_overlap: 0.5           # fallback: fraction of the phone box that lies inside the person box
+
+pose:
+  person_conf: 0.4               # minimum confidence for a person detection
+  keypoint_conf: 0.5             # keypoints below this are ignored by rules and not drawn
+  head_turn_threshold: 0.35      # (later) nose offset from shoulder midpoint / shoulder width
+  lean_threshold_deg: 25         # (later) torso angle away from vertical
+  min_duration_s: 2.0            # (later) posture must persist this long before it is flagged
+
+seats:
+  expected_count: 0              # (later) number of candidates expected in view
+  zones: []                      # (later) seat polygons in pixel coords, for example:
+  #  - id: A1
+  #    polygon: [[100, 200], [300, 200], [300, 400], [100, 400]]
+  max_outside_s: 10              # (later) seconds away from own seat before it is flagged
+
+alerts:
+  cooldown_s: 30                 # (later) min gap between alerts for the same person + reason
+  clip_before_s: 5               # (later) seconds of video saved before the event
+  clip_after_s: 5                # (later) seconds of video saved after the event
+
+runtime:
+  every_nth_frame: 2             # process 1 frame in N (2 = half the frames, ~2x faster)
+  device: cpu                    # "cpu" locally, "0" for the first GPU on Colab
+  imgsz: 640                     # inference image size for both models
+  fallback_fps: 30               # used only if the video file does not report its FPS
+  log_every: 50                  # print progress every N processed frames
+
+privacy:
+  blur_heads: true               # always true for anything saved or shown
+  head_keypoint_conf: 0.3        # low on purpose: better to blur too much than too little
+  head_box_scale: 2.5            # head box side = spread of nose/eye/ear points x this
+  min_head_width_fraction: 0.3   # head box is at least this fraction of the person box width
+  fallback_head_fraction: 0.25   # too few head points: blur this top fraction of the person box
+  blur_kernel: 51                # Gaussian kernel size in pixels (made odd automatically)

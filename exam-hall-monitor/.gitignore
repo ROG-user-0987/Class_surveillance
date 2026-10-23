@@ -1,0 +1,21 @@
+# --- Data -------------------------------------------------------------------
+# data/our_clips/ holds videos of REAL PEOPLE. It must never be committed.
+data/our_clips/
+# Everything else in data/ is ignored too (only the placeholder is kept).
+data/*
+!data/.gitkeep
+
+# --- Outputs ----------------------------------------------------------------
+results/*.mp4
+results/*.avi
+runs/
+
+# --- Model weights ----------------------------------------------------------
+*.pt
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
