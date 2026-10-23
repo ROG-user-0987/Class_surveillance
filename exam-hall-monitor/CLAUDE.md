@@ -10,6 +10,9 @@ phone use and suspicious posture and **flags them for HUMAN review**.
 - Deadline is Sunday: favour simple, working code over clever code.
 - Training happens on Google Colab (GPU). This repo must also run locally on
   CPU for the demo.
+- The user currently runs everything on Colab: on their Windows laptop,
+  Smart App Control blocks PyTorch's unsigned DLLs. `runtime.device: auto`
+  picks the GPU when one is visible.
 
 ## Stack
 Python 3.10+, PyTorch, Ultralytics (YOLOv8, YOLO11, YOLOv8-Pose, ByteTrack),
@@ -25,16 +28,18 @@ exam-hall-monitor/
   .gitignore         ignores data/, results/*.mp4, *.pt, runs/, venvs, caches
   config.yaml        ALL thresholds and paths live here
   data/              videos/datasets (git-ignored; data/our_clips/ = real people)
-  notebooks/         Colab training notebooks
+  notebooks/         Colab notebooks (colab_live_demo.ipynb = live scan demo)
   src/
     __init__.py
     utils.py         config loading, video I/O, drawing, head-region blur
-    tracking.py      person tracking + phone-to-person association  [DONE]
+    tracking.py      person tracking + phone-to-person association,
+                     VideoScan (frame-by-frame generator)          [DONE]
+    live.py          live viewers: notebook, OpenCV window          [DONE]
     detect_phone.py  SAHI / fine-tuned phone detector                [stub]
     pose_rules.py    head-turn / lean rules from keypoints           [stub]
     seat_count.py    seat zones, people count, time outside seat     [stub]
     risk.py          FrameRecord -> Alert (interface done, logic stub)
-  app.py             Streamlit review UI                             [stub]
+  app.py             Streamlit: upload video + live scan [DONE]; review queue [todo]
   evaluate.py        metrics against labelled clips                  [stub]
   results/           annotated videos, alert clips (videos git-ignored)
 ```

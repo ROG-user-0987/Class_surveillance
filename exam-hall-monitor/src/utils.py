@@ -211,13 +211,22 @@ def draw_line(
     cv2.line(frame, to_point(start), to_point(end), color, 2, cv2.LINE_AA)
 
 
+def _outlined_text(frame: np.ndarray, text: str, origin: tuple[int, int]) -> None:
+    """White text with a dark outline, readable on any background."""
+    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                TEXT_COLOR, 1, cv2.LINE_AA)
+
+
+def draw_header(frame: np.ndarray, text: str) -> None:
+    """Write a line of text in the top-left corner of the frame."""
+    _outlined_text(frame, text, (10, 24))
+
+
 def draw_footer(frame: np.ndarray, text: str) -> None:
     """Write a line of text in the bottom-left corner of the frame."""
-    h = frame.shape[0]
-    cv2.putText(frame, text, (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (0, 0, 0), 3, cv2.LINE_AA)  # dark outline so it is readable
-    cv2.putText(frame, text, (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                TEXT_COLOR, 1, cv2.LINE_AA)
+    _outlined_text(frame, text, (10, frame.shape[0] - 12))
 
 
 # ---------------------------------------------------------------------------

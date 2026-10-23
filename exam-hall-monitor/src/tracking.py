@@ -12,9 +12,12 @@ What happens to every processed frame:
     4. One FrameRecord per tracked person is produced. These records are the
        ONLY thing later modules (pose_rules.py, risk.py) consume.
 
+VideoScan runs this over a whole video one frame at a time, so a viewer
+(src/live.py, app.py) can show each annotated frame as soon as it is ready.
+
 Nothing here decides whether anyone is cheating. It only measures.
 
-Run on its own:
+Run on its own (no live view, just saves the annotated video):
     python -m src.tracking --video data/sample.mp4
 """
 
@@ -23,9 +26,10 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -37,6 +41,7 @@ from src.utils import (
     color_for_id,
     draw_box,
     draw_footer,
+    draw_header,
     draw_line,
     draw_skeleton,
     get_video_info,
@@ -116,10 +121,22 @@ class FrameOutput:
     """Everything produced for one frame: records for later modules, plus the
     raw detections that are needed to draw the debug video."""
 
+    timestamp: float
     records: list[FrameRecord]
     people: list[Person]            # includes people with no track_id yet (they still get blurred)
     phones: list[PhoneDetection]
     assignments: list[int | None]   # assignments[i] = track_id that phones[i] belongs to, or None
+
+
+@dataclass
+class LiveFrame:
+    """One processed frame handed to a live viewer by VideoScan.frames()."""
+
+    frame_index: int
+    timestamp: float
+    annotated: np.ndarray  # BGR image, heads already blurred, safe to show
+    output: FrameOutput
+    progress: float        # 0.0 .. 1.0 through the video
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +261,19 @@ def build_records(
 # Models
 # ---------------------------------------------------------------------------
 
+def pick_device(setting: Any) -> str:
+    """Turn runtime.device into something Ultralytics accepts.
+
+    "auto" means the first GPU if PyTorch can see one (e.g. on Colab),
+    otherwise the CPU. Anything else ("cpu", 0, "0") is passed through.
+    """
+    if str(setting).lower() != "auto":
+        return str(setting)
+    import torch
+
+    return "0" if torch.cuda.is_available() else "cpu"
+
+
 class ExamHallTracker:
     """Loads both models once, then processes frames one at a time.
 
@@ -257,6 +287,9 @@ class ExamHallTracker:
         from ultralytics import YOLO
 
         self.cfg = cfg
+        self.device = pick_device(cfg["runtime"]["device"])
+        print(f"Device: {'GPU ' + self.device if self.device != 'cpu' else 'CPU'}")
+
         paths = cfg["paths"]
         self.pose_model = YOLO(str(resolve_path(paths["pose_weights"])))
         self.phone_model = YOLO(str(resolve_path(paths["phone_weights"])))
@@ -290,17 +323,22 @@ class ExamHallTracker:
             min_box_overlap=assoc["min_box_overlap"],
         )
         records = build_records(frame_index, timestamp, people, phones, assignments)
-        return FrameOutput(records, people, phones, assignments)
+        return FrameOutput(
+            timestamp=timestamp,
+            records=records,
+            people=people,
+            phones=phones,
+            assignments=assignments,
+        )
 
     def _track_people(self, frame: np.ndarray) -> list[Person]:
-        runtime = self.cfg["runtime"]
         result = self.pose_model.track(
             frame,
             persist=True,                  # keep ByteTrack state between calls
             tracker=self.tracker_config,
             conf=self.cfg["pose"]["person_conf"],
-            imgsz=runtime["imgsz"],
-            device=runtime["device"],
+            imgsz=self.cfg["runtime"]["imgsz"],
+            device=self.device,
             verbose=False,
         )[0]
 
@@ -321,13 +359,12 @@ class ExamHallTracker:
         return [Person(track_id=t, box=b, keypoints=k) for t, b, k in zip(ids, boxes, keypoints)]
 
     def _detect_phones(self, frame: np.ndarray) -> list[PhoneDetection]:
-        runtime = self.cfg["runtime"]
         result = self.phone_model.predict(
             frame,
             classes=[self.phone_class_id],  # keep ONLY the phone class
             conf=self.cfg["phone"]["conf_threshold"],
-            imgsz=runtime["imgsz"],
-            device=runtime["device"],
+            imgsz=self.cfg["runtime"]["imgsz"],
+            device=self.device,
             verbose=False,
         )[0]
 
@@ -381,65 +418,115 @@ def draw_frame(frame: np.ndarray, output: FrameOutput, cfg: dict[str, Any]) -> n
             draw_box(canvas, phone.box, PHONE_COLOR, f"phone {phone.conf:.2f} -> ID {owner}")
             draw_line(canvas, box_centre(phone.box), person_centres[owner], PHONE_COLOR)
 
+    # 4. Status line at the top: video time and what is visible right now.
+    minutes, seconds = divmod(int(output.timestamp), 60)
+    header = f"{minutes:02d}:{seconds:02d}  people: {len(output.people)}  phones: {len(output.phones)}"
+    near = sorted({owner for owner in output.assignments if owner is not None})
+    if near:
+        header += "  (phone near ID " + ", ".join(str(i) for i in near) + ")"
+    draw_header(canvas, header)
+
     draw_footer(canvas, "Detections are for human review only")
     return canvas
 
 
 # ---------------------------------------------------------------------------
-# Whole-video run
+# Whole-video scan, one frame at a time
 # ---------------------------------------------------------------------------
 
+class VideoScan:
+    """Scan one video frame by frame, saving the annotated copy as it goes.
+
+    Usage:
+        scan = VideoScan(video_path, cfg)
+        with closing(scan.frames()) as frames:   # closing() makes sure the
+            for live in frames:                   # output file is finished
+                show(live.annotated)              # even if you stop early
+        print(scan.summary())
+    """
+
+    def __init__(
+        self, video_path: str | Path, cfg: dict[str, Any], output_path: str | Path | None = None
+    ) -> None:
+        self.video_path = Path(video_path)
+        self.cfg = cfg
+        self.every_nth = int(cfg["runtime"]["every_nth_frame"])
+        self.info = get_video_info(self.video_path, cfg["runtime"]["fallback_fps"])
+        if output_path is None:
+            output_path = resolve_path(cfg["paths"]["output_dir"]) / f"{self.video_path.stem}_tracked.mp4"
+        self.output_path = Path(output_path)
+        self.tracker = ExamHallTracker(cfg)
+
+        # Running totals, used for the summary.
+        self.frames_processed = 0
+        self.track_ids: set[int] = set()
+        self.phone_detections = 0
+        self.phones_assigned = 0
+        self.seconds = 0.0
+
+    def frames(self) -> Iterator[LiveFrame]:
+        """Yield each processed frame as soon as it is ready."""
+        fps_out = self.info["fps"] / self.every_nth  # saved video plays at real-time speed
+        writer = make_video_writer(self.output_path, fps_out, self.info["width"], self.info["height"])
+        expected = max(self.info["frame_count"] // self.every_nth, 1)
+        start = time.time()
+
+        try:
+            for frame_index, timestamp, frame in read_video(
+                self.video_path, self.every_nth, self.cfg["runtime"]["fallback_fps"]
+            ):
+                output = self.tracker.process_frame(frame_index, timestamp, frame)
+                annotated = draw_frame(frame, output, self.cfg)
+                writer.write(annotated)
+
+                self.frames_processed += 1
+                self.track_ids.update(r.track_id for r in output.records)
+                self.phone_detections += len(output.phones)
+                self.phones_assigned += sum(owner is not None for owner in output.assignments)
+                self.seconds = time.time() - start
+
+                yield LiveFrame(
+                    frame_index=frame_index,
+                    timestamp=timestamp,
+                    annotated=annotated,
+                    output=output,
+                    progress=min(self.frames_processed / expected, 1.0),
+                )
+        finally:
+            writer.release()  # always finish the file, even if the viewer stops early
+
+    def summary(self) -> dict[str, Any]:
+        """Totals so far (call after frames() has finished or been stopped)."""
+        return {
+            "video": str(self.video_path),
+            "output": str(self.output_path),
+            "frames_total": self.info["frame_count"],
+            "every_nth": self.every_nth,
+            "frames_processed": self.frames_processed,
+            "people_seen": len(self.track_ids),
+            "phone_detections": self.phone_detections,
+            "phones_assigned": self.phones_assigned,
+            "phones_unassigned": self.phone_detections - self.phones_assigned,
+            "seconds": self.seconds,
+            "fps": self.frames_processed / self.seconds if self.seconds > 0 else 0.0,
+        }
+
+
 def run_on_video(
-    video_path: Path, cfg: dict[str, Any], output_path: Path | None = None
+    video_path: str | Path, cfg: dict[str, Any], output_path: str | Path | None = None
 ) -> tuple[list[FrameRecord], dict[str, Any]]:
-    """Process a whole video, save the annotated copy, return (records, summary)."""
-    runtime = cfg["runtime"]
-    every_nth = int(runtime["every_nth_frame"])
-    info = get_video_info(video_path, runtime["fallback_fps"])
-
-    if output_path is None:
-        output_path = resolve_path(cfg["paths"]["output_dir"]) / f"{video_path.stem}_tracked.mp4"
-    # Output FPS = input FPS / N, so the saved video plays at real-time speed.
-    writer = make_video_writer(output_path, info["fps"] / every_nth, info["width"], info["height"])
-    tracker = ExamHallTracker(cfg)
-
+    """Process a whole video without a live view; return (records, summary)."""
+    scan = VideoScan(video_path, cfg, output_path)
+    expected = max(scan.info["frame_count"] // scan.every_nth, 1)
     all_records: list[FrameRecord] = []
-    track_ids: set[int] = set()
-    frames_processed = phones_total = phones_assigned = 0
-    expected = max(info["frame_count"] // every_nth, 1)
-    start = time.time()
 
-    try:
-        for frame_index, timestamp, frame in read_video(video_path, every_nth, runtime["fallback_fps"]):
-            output = tracker.process_frame(frame_index, timestamp, frame)
-            writer.write(draw_frame(frame, output, cfg))
+    with closing(scan.frames()) as frames:
+        for live in frames:
+            all_records.extend(live.output.records)
+            if scan.frames_processed % cfg["runtime"]["log_every"] == 0:
+                print(f"  processed {scan.frames_processed}/~{expected} frames (t = {live.timestamp:.1f}s)")
 
-            all_records.extend(output.records)
-            track_ids.update(r.track_id for r in output.records)
-            phones_total += len(output.phones)
-            phones_assigned += sum(owner is not None for owner in output.assignments)
-            frames_processed += 1
-
-            if frames_processed % runtime["log_every"] == 0:
-                print(f"  processed {frames_processed}/~{expected} frames (t = {timestamp:.1f}s)")
-    finally:
-        writer.release()  # always close the file, even on Ctrl+C
-
-    elapsed = time.time() - start
-    summary = {
-        "video": str(video_path),
-        "output": str(output_path),
-        "frames_total": info["frame_count"],
-        "every_nth": every_nth,
-        "frames_processed": frames_processed,
-        "people_seen": len(track_ids),
-        "phone_detections": phones_total,
-        "phones_assigned": phones_assigned,
-        "phones_unassigned": phones_total - phones_assigned,
-        "seconds": elapsed,
-        "fps": frames_processed / elapsed if elapsed > 0 else 0.0,
-    }
-    return all_records, summary
+    return all_records, scan.summary()
 
 
 def print_summary(summary: dict[str, Any]) -> None:
@@ -453,8 +540,8 @@ def print_summary(summary: dict[str, Any]) -> None:
     print(f"Phone detections:  {summary['phone_detections']}")
     print(f"  assigned:        {summary['phones_assigned']}")
     print(f"  unassigned:      {summary['phones_unassigned']}")
-    print(f"Speed:             {summary['fps']:.1f} processed frames/s "
-          f"({summary['seconds']:.0f}s total)")
+    print(f"Wall time:         {summary['seconds']:.0f}s "
+          f"({summary['fps']:.1f} processed frames/s, including any live display)")
     print(f"Annotated video:   {summary['output']}")
 
 
@@ -470,10 +557,9 @@ def main() -> None:
 
     cfg = load_config(args.config)
     video = resolve_input_video(args.video, cfg)
-    output = Path(args.output) if args.output else None
 
-    print(f"Processing {video} on device '{cfg['runtime']['device']}' ...")
-    _, summary = run_on_video(video, cfg, output)
+    print(f"Processing {video} ...")
+    _, summary = run_on_video(video, cfg, args.output)
     print_summary(summary)
 
 

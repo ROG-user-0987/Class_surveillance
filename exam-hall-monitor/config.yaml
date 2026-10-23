@@ -44,13 +44,18 @@ alerts:
 
 runtime:
   every_nth_frame: 2             # process 1 frame in N (2 = half the frames, ~2x faster)
-  device: cpu                    # "cpu" locally, "0" for the first GPU on Colab
+  device: auto                   # auto = GPU if PyTorch sees one (Colab), else CPU; or "cpu" / 0
   imgsz: 640                     # inference image size for both models
   fallback_fps: 30               # used only if the video file does not report its FPS
   log_every: 50                  # print progress every N processed frames
 
+live:                            # watching a scan while the video plays
+  realtime: true                 # wait so playback is never faster than the real video
+  display_width: 960             # live view is shrunk to this width (saved video stays full size)
+  jpeg_quality: 80               # notebook live view compression (lower = smoother on slow links)
+
 privacy:
-  blur_heads: true               # always true for anything saved or shown
+  blur_heads: true              # always true for anything saved or shown
   head_keypoint_conf: 0.3        # low on purpose: better to blur too much than too little
   head_box_scale: 2.5            # head box side = spread of nose/eye/ear points x this
   min_head_width_fraction: 0.3   # head box is at least this fraction of the person box width
