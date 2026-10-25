@@ -11,6 +11,9 @@ streamlit>=1.30
 pandas>=2.0
 matplotlib>=3.7
 
+# Evaluation: scores all phone detection modes with the same COCO evaluator
+pycocotools>=2.0.6
+
 # Already installed by ultralytics; listed because we import them directly
 numpy
 pyyaml
