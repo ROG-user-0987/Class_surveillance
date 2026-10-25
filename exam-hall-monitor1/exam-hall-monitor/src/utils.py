@@ -49,7 +49,8 @@ PHONE_COLOR = (255, 255, 0)        # cyan
 UNASSIGNED_COLOR = (160, 160, 160)  # grey
 TEXT_COLOR = (255, 255, 255)        # white
 ZONE_COLOR = (200, 200, 200)        # light grey seat outlines
-TIER_COLORS = {"red": (0, 0, 255), "orange": (0, 140, 255)}  # review priority colours
+TIER_COLORS = {"red": (0, 0, 255), "orange": (0, 140, 255),  # review priority colours
+               "grey": (150, 150, 150)}                       # grey = "cannot assess"
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,14 @@ def resize_to_width(frame: np.ndarray, width: int) -> np.ndarray:
     return cv2.resize(frame, (width, int(h * width / w)), interpolation=cv2.INTER_AREA)
 
 
+def encode_jpeg(frame: np.ndarray, quality: int) -> np.ndarray:
+    """JPEG-encode a frame (returns the bytes as a numpy array)."""
+    ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise RuntimeError("JPEG encoding failed")
+    return jpg
+
+
 @dataclass
 class _OpenClip:
     writer: cv2.VideoWriter
@@ -189,12 +198,13 @@ class ClipRecorder:
         self.fps = fps
         self.width = width
         self.jpeg_quality = jpeg_quality
-        self.recent: deque[np.ndarray] = deque(maxlen=max(1, round(before_s * fps)))
+        # (timestamp, jpeg) pairs for the last `before_s` seconds
+        self.recent: deque[tuple[float, np.ndarray]] = deque(maxlen=max(1, round(before_s * fps)))
         self.after_frames = max(1, round(after_s * fps))
         self.open_clips: list[_OpenClip] = []
 
-    def add_frame(self, frame: np.ndarray) -> None:
-        """Call once per processed frame."""
+    def add_frame(self, frame: np.ndarray, timestamp: float = 0.0) -> None:
+        """Call once per processed frame (timestamp = seconds into the video)."""
         small = resize_to_width(frame, self.width)
 
         # Feed clips that are still recording their "after" part.
@@ -205,13 +215,17 @@ class ClipRecorder:
             clip.writer.release()
             self.open_clips.remove(clip)
 
-        ok, jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
-        if ok:
-            self.recent.append(jpg)
+        self.recent.append((timestamp, encode_jpeg(small, self.jpeg_quality)))
+
+    def jpeg_near(self, timestamp: float) -> np.ndarray | None:
+        """The buffered JPEG closest in time to `timestamp` (None if empty)."""
+        if not self.recent:
+            return None
+        return min(self.recent, key=lambda item: abs(item[0] - timestamp))[1]
 
     def start_clip(self, name: str) -> Path:
         """Start a clip called <name>.mp4 (call right after add_frame)."""
-        frames = [cv2.imdecode(jpg, cv2.IMREAD_COLOR) for jpg in self.recent]
+        frames = [cv2.imdecode(jpg, cv2.IMREAD_COLOR) for _, jpg in self.recent]
         h, w = frames[-1].shape[:2]
         path = self.folder / f"{name}.mp4"
         writer = make_video_writer(path, self.fps, w, h)

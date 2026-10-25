@@ -9,7 +9,14 @@ data/*
 results/**/*.mp4
 results/**/*.avi
 results/**/*.csv
+# thumbnails, gallery images, plots, mode predictions and cached pose data
+# all come from footage of real people
+results/**/*.jpg
+results/**/*.png
+results/**/*.json
+results/cache/
 runs/
+.pytest_cache/
 
 # --- Model weights ----------------------------------------------------------
 *.pt

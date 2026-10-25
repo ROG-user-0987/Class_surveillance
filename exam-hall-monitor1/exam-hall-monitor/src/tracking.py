@@ -38,7 +38,8 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from src.risk import Alert, RiskScorer, format_alert, save_alerts_csv
+from src.detect_phone import PhoneDetection, PhoneDetector  # PhoneDetection is re-exported here
+from src.risk import Alert, RiskScorer, format_alert, peak_time_of, save_alerts_csv
 from src.seat_count import load_zones
 from src.utils import (
     PHONE_COLOR,
@@ -55,10 +56,12 @@ from src.utils import (
     draw_line,
     draw_polygon,
     draw_skeleton,
+    encode_jpeg,
     get_video_info,
     load_config,
     make_video_writer,
     read_video,
+    resize_to_width,
     resolve_input_video,
     resolve_path,
 )
@@ -120,14 +123,6 @@ class Person:
 
 
 @dataclass
-class PhoneDetection:
-    """A phone box from the phone detector in one frame."""
-
-    box: np.ndarray  # (4,) [x1, y1, x2, y2]
-    conf: float
-
-
-@dataclass
 class FrameOutput:
     """Everything produced for one frame: records for later modules, plus the
     raw detections that are needed to draw the debug video."""
@@ -178,6 +173,19 @@ def overlap_fraction(inner: np.ndarray, outer: np.ndarray) -> float:
 # Phone -> person association
 # ---------------------------------------------------------------------------
 
+def wrist_distance(phone: PhoneDetection, person: Person, keypoint_conf: float) -> float:
+    """Distance from the phone's centre to the person's nearest confident
+    wrist, divided by the person's box height (inf if no wrist is visible)."""
+    cx, cy = box_centre(phone.box)
+    height = max(float(person.box[3] - person.box[1]), 1.0)
+    best = math.inf
+    for k in WRIST_KEYPOINTS:
+        x, y, conf = person.keypoints[k]
+        if conf >= keypoint_conf:
+            best = min(best, math.hypot(x - cx, y - cy) / height)
+    return best
+
+
 def associate_phones(
     phones: list[PhoneDetection],
     people: list[Person],
@@ -189,6 +197,9 @@ def associate_phones(
     """Assign each phone to at most one tracked person.
 
     For each phone:
+      0. Crop mode only: if the phone was found in a tracked person's own crop
+         (phone.crop_owner), that person gets it, but only if they pass the
+         wrist rule or the box rule below on their own. Otherwise continue.
       1. Wrist rule: find the nearest wrist (left or right) with confidence
          >= keypoint_conf. The distance is divided by that person's box
          height, so near and far students are treated the same. If it is
@@ -207,19 +218,21 @@ def associate_phones(
     assignments: list[int | None] = []
 
     for phone in phones:
-        cx, cy = box_centre(phone.box)
+        # --- 0. Crop mode: try the person whose crop found it ------------
+        owner = next((p for p in tracked if p.track_id == phone.crop_owner), None)
+        if owner is not None and (
+            wrist_distance(phone, owner, keypoint_conf) <= max_wrist_distance
+            or overlap_fraction(phone.box, owner.box) >= min_box_overlap
+        ):
+            assignments.append(owner.track_id)
+            continue
 
         # --- 1. Nearest confident wrist ---------------------------------
         best_id, best_distance = None, math.inf
         for person in tracked:
-            height = max(float(person.box[3] - person.box[1]), 1.0)
-            for k in WRIST_KEYPOINTS:
-                x, y, conf = person.keypoints[k]
-                if conf < keypoint_conf:
-                    continue
-                distance = math.hypot(x - cx, y - cy) / height
-                if distance < best_distance:
-                    best_id, best_distance = person.track_id, distance
+            distance = wrist_distance(phone, person, keypoint_conf)
+            if distance < best_distance:
+                best_id, best_distance = person.track_id, distance
 
         if best_id is not None and best_distance <= max_wrist_distance:
             assignments.append(best_id)
@@ -332,14 +345,21 @@ class ExamHallTracker:
             )
         print(f"Phone class: {self.phone_class_id} = '{names[self.phone_class_id]}'")
 
-        if cfg["phone"]["sahi"]:
-            print("[warning] phone.sahi is true, but SAHI is not wired in yet "
-                  "(planned for detect_phone.py). Using full-frame detection.")
+        # Full-frame, SAHI or per-person crops (phone.mode); same weights for all.
+        self.phone_detector = PhoneDetector(self.phone_model, cfg, self.device)
+        print(f"Phone detection mode: {self.phone_detector.mode}")
+
+    def detect(
+        self, frame: np.ndarray, phone_conf: float | None = None
+    ) -> tuple[list[Person], list[PhoneDetection]]:
+        """Tracked people and phone boxes in one frame, before association.
+        evaluate.py caches these so threshold sweeps don't re-run the models."""
+        people = self._track_people(frame)
+        return people, self._detect_phones(frame, people, conf=phone_conf)
 
     def process_frame(self, frame_index: int, timestamp: float, frame: np.ndarray) -> FrameOutput:
         """Track people, detect phones, associate them, build FrameRecords."""
-        people = self._track_people(frame)
-        phones = self._detect_phones(frame)
+        people, phones = self.detect(frame)
         assoc = self.cfg["association"]
         assignments = associate_phones(
             phones,
@@ -384,22 +404,11 @@ class ExamHallTracker:
 
         return [Person(track_id=t, box=b, keypoints=k) for t, b, k in zip(ids, boxes, keypoints)]
 
-    def _detect_phones(self, frame: np.ndarray) -> list[PhoneDetection]:
-        result = self.phone_model.predict(
-            frame,
-            classes=[self.phone_class_id],  # keep ONLY the phone class
-            conf=self.cfg["phone"]["conf_threshold"],
-            imgsz=self.cfg["runtime"]["imgsz"],
-            device=self.device,
-            verbose=False,
-        )[0]
-
-        if result.boxes is None or len(result.boxes) == 0:
-            return []
-
-        boxes = result.boxes.xyxy.cpu().numpy().astype(np.float32)
-        confs = result.boxes.conf.cpu().numpy()
-        return [PhoneDetection(box=b, conf=float(c)) for b, c in zip(boxes, confs)]
+    def _detect_phones(
+        self, frame: np.ndarray, people: list[Person], conf: float | None = None
+    ) -> list[PhoneDetection]:
+        """Phones in the frame (see src/detect_phone.py for the three modes)."""
+        return self.phone_detector.detect(frame, people, conf=conf)
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +458,8 @@ def draw_frame(
         label = f"ID {person.track_id}" if person.track_id is not None else "ID ?"
         person_flags = flags.get(person.track_id, [])
         if person_flags:
-            tier = "red" if any(t == "red" for t, _ in person_flags) else "orange"
+            tiers = {t for t, _ in person_flags}
+            tier = next(t for t in ("red", "orange", "grey") if t in tiers)  # most urgent first
             label += " REVIEW: " + ", ".join(text for _, text in person_flags)
             draw_box(canvas, person.box, TIER_COLORS[tier], label, thickness=4)
         else:
@@ -512,7 +522,7 @@ class VideoScan:
         self.output_path = Path(output_path)
 
         # Alerts CSV and clips are named after the output video.
-        name = self.output_path.stem.removesuffix("_tracked")
+        self.name = name = self.output_path.stem.removesuffix("_tracked")
         self.alerts_csv = self.output_path.with_name(f"{name}_alerts.csv")
         self.clips_dir = self.output_path.parent / "clips" / name
 
@@ -539,6 +549,7 @@ class VideoScan:
                                  live_cfg["jpeg_quality"])
         expected = max(self.info["frame_count"] // self.every_nth, 1)
         start = time.time()
+        last_timestamp, last_annotated = 0.0, None
 
         try:
             for frame_index, timestamp, frame in read_video(
@@ -550,10 +561,10 @@ class VideoScan:
                 writer.write(annotated)
 
                 if clips is not None:
-                    clips.add_frame(annotated)
-                    new_alerts = [replace(a, clip_path=str(clips.start_clip(clip_name(a))))
-                                  for a in new_alerts]
+                    clips.add_frame(annotated, timestamp)
+                new_alerts = [self._finish_alert(a, annotated, clips) for a in new_alerts]
                 self.alerts.extend(new_alerts)
+                last_timestamp, last_annotated = timestamp, annotated
 
                 self.frames_processed += 1
                 self.track_ids.update(r.track_id for r in output.records)
@@ -570,11 +581,38 @@ class VideoScan:
                     new_alerts=new_alerts,
                 )
         finally:
+            # Alerts still waiting at the end: combined alerts inside their
+            # fusion window, and "cannot assess" periods that are still open.
+            if last_annotated is not None:
+                self.alerts.extend(self._finish_alert(a, last_annotated, clips)
+                                   for a in self.risk.finish(last_timestamp))
             # Always finish the files, even if the viewer stops early.
             writer.release()
             if clips is not None:
                 clips.close()
             save_alerts_csv(self.alerts, self.alerts_csv)
+
+    def _finish_alert(self, alert: Alert, annotated: np.ndarray, clips: ClipRecorder | None) -> Alert:
+        """Give a new alert its unique id, its review clip and, with
+        features.evidence_alerts, a thumbnail of the peak frame."""
+        updates: dict[str, Any] = {"alert_id": f"{self.name}-{alert.alert_id}"}
+        if clips is not None:
+            updates["clip_path"] = str(clips.start_clip(clip_name(alert)))
+        if self.risk.evidence:
+            updates["thumbnail_path"] = str(self._save_thumbnail(alert, annotated, clips))
+        return replace(alert, **updates)
+
+    def _save_thumbnail(self, alert: Alert, annotated: np.ndarray, clips: ClipRecorder | None) -> Path:
+        """Save the frame where the alert's signal peaked as a JPEG next to its
+        clip. Frames are annotated, so heads are already blurred."""
+        jpg = clips.jpeg_near(peak_time_of(alert)) if clips is not None else None
+        if jpg is None:  # no clip buffer: use the current frame instead
+            live = self.cfg["live"]
+            jpg = encode_jpeg(resize_to_width(annotated, live["display_width"]), live["jpeg_quality"])
+        path = self.clips_dir / f"{clip_name(alert)}.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(jpg.tobytes())
+        return path
 
     def summary(self) -> dict[str, Any]:
         """Totals so far (call after frames() has finished or been stopped)."""
@@ -593,6 +631,7 @@ class VideoScan:
             "alerts": list(self.alerts),
             "alerts_red": sum(a.tier == "red" for a in self.alerts),
             "alerts_orange": sum(a.tier == "orange" for a in self.alerts),
+            "alerts_grey": sum(a.tier == "grey" for a in self.alerts),
             "alerts_csv": str(self.alerts_csv),
             "clips_dir": str(self.clips_dir),
             "seconds": self.seconds,
@@ -633,8 +672,9 @@ def print_summary(summary: dict[str, Any]) -> None:
     print(f"Wall time:         {summary['seconds']:.0f}s on {summary['device']} "
           f"({summary['fps']:.1f} processed frames/s, including any live display)")
     print(f"Annotated video:   {summary['output']}")
+    grey = f", grey/cannot assess {summary['alerts_grey']}" if summary.get("alerts_grey") else ""
     print(f"\nFlags for HUMAN review: {len(summary['alerts'])} "
-          f"(red {summary['alerts_red']}, orange {summary['alerts_orange']})")
+          f"(red {summary['alerts_red']}, orange {summary['alerts_orange']}{grey})")
     for alert in summary["alerts"]:
         print(f"  {format_alert(alert)}")
     if summary["alerts"]:
