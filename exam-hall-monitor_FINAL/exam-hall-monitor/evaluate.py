@@ -56,6 +56,7 @@ from typing import Any
 import cv2
 
 from src.detect_phone import MODES, PhoneDetection, compare_modes, detection_mode
+from src.metrics import wilson_ci
 from src.risk import Alert, RiskScorer, alert_duration, peak_time_of
 from src.tracking import (
     ExamHallTracker,
@@ -190,7 +191,9 @@ def score(
         per_hour, basis = honest_fp / (honest_s / 3600), "honest clips"
     else:
         per_hour, basis = (fp / (total_s / 3600) if total_s > 0 else 0.0), "all clips"
+    # 95% Wilson intervals: with a few dozen events, 0.80 could really be 0.6-0.9.
     return {"precision": precision, "recall": recall, "f1": f1,
+            "precision_ci95": wilson_ci(tp, tp + fp), "recall_ci95": wilson_ci(tp, tp + fn),
             "false_alerts_per_hour": round(per_hour, 2), "tp": tp, "fp": fp, "fn": fn,
             "false_alert_basis": basis}
 
@@ -514,6 +517,10 @@ def main() -> None:
     print_table("Event evaluation (current config)", rows,
                 ["clip", "events", "alerts", "tp", "fp", "fn", "precision", "recall", "f1"])
     print(f"False alerts per hour ({overall['false_alert_basis']}): {overall['false_alerts_per_hour']}")
+    for name in ("precision", "recall"):
+        ci = overall[f"{name}_ci95"]
+        if ci:
+            print(f"{name.capitalize()} 95% CI (Wilson): {ci[0]:.2f} - {ci[1]:.2f}")
 
     condition_rows = per_condition(clips, alerts, cfg, out_dir)
     if condition_rows:

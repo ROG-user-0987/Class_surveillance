@@ -64,6 +64,7 @@ Run everything from the repo root.
 | Phone detection with one mode (full / sahi / crop) | `python -m src.detect_phone --video data/sample.mp4 --mode crop` | done |
 | Evaluation against labelled clips | `python evaluate.py --video data/clip.mp4 --labels data/labels.csv` | done |
 | Compare the 3 phone detection modes | `python evaluate.py --compare-modes --gt data/phone_set` | done |
+| Metrics for a scanned video (no labels needed) | `python -m src.metrics --alerts results/sample_alerts.csv --plot` | done |
 | Tests (no video or models needed) | `python -m pytest tests` (or `python tests/test_cues.py` etc.) | done |
 
 `--video` can be left out if `paths.input_video` is set in `config.yaml`.
@@ -85,6 +86,8 @@ Run everything from the repo root.
 - `results/clips/<video name>/`: a short clip around every flag (heads
   blurred), e.g. `01m23s_ID4_phone.mp4`, plus a `.jpg` of the peak frame when
   `evidence_alerts` is on.
+- `results/<video name>_summary.json`: the run summary for `src/metrics.py`
+  (speed, milliseconds per frame for each stage, people per frame, track IDs).
 
 ### Flags for human review
 
@@ -168,6 +171,27 @@ An alert counts as correct if it overlaps a labelled event of the same type
 (± `evaluation.match_tolerance_s`); each labelled event can be matched once.
 Detections are cached in `results/cache/`, so sweeps and ablations only re-run
 the cheap rule logic, not the models.
+
+## Metrics without labels (`src/metrics.py`)
+
+`evaluate.py` needs labelled clips. `src/metrics.py` measures a scan without them,
+and turns review decisions into precision:
+
+```bash
+python -m src.metrics --alerts results/sample_alerts.csv --plot
+```
+
+| Group | Metrics |
+|---|---|
+| Run (from `<video>_summary.json`) | processed frames/s, ms per frame for models / rules / drawing, max and mean people per frame, track IDs per visible person (1.0 = nobody lost their ID) |
+| Alerts | alerts per minute / hour by tier and cue, students alerted, alerts per student, share of head-turn detections that used a personal baseline, median head turn vs `pose.head_turn_threshold`, share of events that fired at the minimum duration, smallest same-cue gap (cooldown check) |
+| Review | precision = confirmed / (confirmed + dismissed) for red + orange, per tier and per cue, each with a 95% Wilson confidence interval; grey alerts are reported separately as correct abstentions |
+
+Review decisions come from the `review_decision` column (dashboard). If nobody
+has reviewed yet, a `draft_verdict` column (`supported` / `not_supported` /
+`unclear`) with an optional `draft_cause` is used instead. Output:
+`results/<video>_metrics.json` (+ `_metrics.png` with `--plot`).
+`evaluate.py` also prints 95% confidence intervals for precision and recall now.
 
 ## Reviewing alerts (dashboard)
 

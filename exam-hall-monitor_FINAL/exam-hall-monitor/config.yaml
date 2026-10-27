@@ -120,6 +120,10 @@ evaluation:                      # evaluate.py and the detection-mode comparison
   gt_class_id: 0                 # mode comparison: phone class id in YOLO-format label files
   fps_warmup: 3                  # mode comparison: images run before timing starts (model warm-up)
 
+metrics:                         # python -m src.metrics (metrics without labels; see src/metrics.py)
+  near_threshold_factor: 1.5     # head-turn events whose mean was below this x pose.head_turn_threshold
+                                 # count as "barely over the threshold"
+
 runtime:
   every_nth_frame: 2             # process 1 frame in N (2 = half the frames, ~2x faster)
   device: auto                   # auto = GPU if PyTorch sees one (Colab), else CPU; or "cpu" / 0

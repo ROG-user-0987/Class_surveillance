@@ -38,6 +38,7 @@ BASE_CFG = {
                          "combined": "orange", "low_visibility": "grey"}},
     "evaluation": {"match_tolerance_s": 1.0, "sweep_conf": [0.2, 0.3], "sweep_min_duration": [0.5, 1.0],
                    "gallery_max": 6, "map_conf": 0.01, "map_iou": 0.5, "gt_class_id": 0, "fps_warmup": 0},
+    "metrics": {"near_threshold_factor": 1.5},
     "runtime": {"every_nth_frame": 1, "device": "cpu", "imgsz": 640, "fallback_fps": 30, "log_every": 1000},
     "live": {"realtime": False, "display_width": 640, "jpeg_quality": 80},
     "privacy": {"blur_heads": True, "head_keypoint_conf": 0.3, "head_box_scale": 2.5,

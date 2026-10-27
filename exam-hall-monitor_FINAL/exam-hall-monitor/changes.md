@@ -333,3 +333,58 @@ streamlit run app.py                                       # review dashboard
 ```
 To reproduce the original behaviour for comparison, set every switch under
 `features:` to `false` and `phone.mode: full`.
+
+## Fixes after the upgrade
+
+- **`notebooks/colab_live_demo.ipynb`, cell 2**: it used to `%cd` into a fixed
+  path (`My Drive/exam-hall-monitor`). If the folder wasn't exactly there, the
+  next cell failed with `Could not open requirements file: 'requirements.txt'`.
+  Google Drive does not unzip uploaded zips, so uploading `exam-hall-monitor.zip`
+  alone caused exactly this. The cell now looks for the project folder in My
+  Drive (up to two folders deep, any name starting with `exam-hall-monitor`)
+  and, if it only finds the zip, unzips it next to the zip first.
+
+---
+
+## Metrics (added after the first demo run)
+
+### New file `src/metrics.py`
+- **What:** `python -m src.metrics --alerts results/<video>_alerts.csv [--plot]`
+  measures a scan without labelled clips:
+  - **Run:** processed frames/s, milliseconds per frame for each stage
+    (models, rules, drawing), people per frame, and track IDs per visible
+    person (how often ByteTrack lost and re-issued IDs).
+  - **Alerts:** alerts per minute and per hour by tier and cue, students
+    alerted, alerts per student, how many head-turn detections used a personal
+    baseline, how far above `pose.head_turn_threshold` the turns were, share of
+    events that fired exactly at the minimum duration, smallest gap between
+    two alerts of the same cue for one student (cooldown check).
+  - **Review:** precision = confirmed / (confirmed + dismissed) for red +
+    orange alerts, overall, per tier and per cue, with 95% Wilson confidence
+    intervals. Grey alerts are counted separately (correct abstentions).
+    Uses `review_decision` from the dashboard, or a `draft_verdict` /
+    `draft_cause` column when no one has reviewed yet.
+- **Why:** our recording has no labelled events yet, so `evaluate.py` could not
+  produce numbers. These metrics come straight from the alert log, and review
+  precision needs only the Confirm / Dismiss buttons. Confidence intervals
+  matter because we have dozens of alerts, not thousands.
+- **Settings:** `metrics.near_threshold_factor` in `config.yaml`.
+
+### `src/tracking.py`: stage timing and a summary file
+- `VideoScan` times three stages per frame with `StageTimer` (models, rules,
+  drawing), counts people per frame, and writes
+  `results/<video>_summary.json` when a scan ends (also when it is stopped
+  early). `print_summary` shows ms per stage and people per frame.
+- Outputs (video, alerts, clips) are unchanged, so the "all switches off =
+  original" rule still holds.
+
+### `evaluate.py` and `app.py`
+- `score()` also returns `precision_ci95` and `recall_ci95` (Wilson); the
+  console prints them under the event table.
+- The dashboard shows the 95% interval under "Reviewer precision".
+
+### Tests
+- `tests/test_metrics.py` (6 tests, synthetic alerts, no video or models):
+  Wilson interval, alert metrics, review precision ignoring grey and
+  unclear, dashboard decisions taking priority over drafts, summary
+  metrics, stage timer.

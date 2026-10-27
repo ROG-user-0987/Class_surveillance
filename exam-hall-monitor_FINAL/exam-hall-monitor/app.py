@@ -29,6 +29,7 @@ import streamlit as st
 from src.detect_phone import MODES, detection_mode
 from src.live import RealtimePacer, status_line
 from src.risk import format_alert, read_alerts_csv, update_review_decision
+from src.metrics import wilson_ci
 from src.tracking import VideoScan
 from src.utils import load_config, resize_to_width, resolve_path
 
@@ -170,6 +171,11 @@ with review_tab:
         precision = f"{confirmed / (confirmed + dismissed):.0%}" if confirmed + dismissed else "-"
         cols[5].metric("Reviewer precision", precision,
                        help="confirmed / (confirmed + dismissed), red and orange only")
+        ci = wilson_ci(confirmed, confirmed + dismissed)
+        if ci:
+            st.caption(f"Reviewer precision 95% confidence interval (Wilson): {ci[0]:.0%} - {ci[1]:.0%} "
+                       f"from {confirmed + dismissed} reviewed alerts. "
+                       "Full metrics: python -m src.metrics --alerts <this CSV> --plot")
 
         show = st.multiselect("Show tiers", ["red", "orange", "grey"], default=["red", "orange", "grey"])
         st.caption(f"File: {review_csv}")

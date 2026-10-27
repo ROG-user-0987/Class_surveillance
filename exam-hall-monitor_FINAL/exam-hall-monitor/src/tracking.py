@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import time
 from contextlib import closing
@@ -39,6 +40,7 @@ from typing import Any, Iterator
 import numpy as np
 
 from src.detect_phone import PhoneDetection, PhoneDetector  # PhoneDetection is re-exported here
+from src.metrics import StageTimer
 from src.risk import Alert, RiskScorer, format_alert, peak_time_of, save_alerts_csv
 from src.seat_count import load_zones
 from src.utils import (
@@ -524,6 +526,7 @@ class VideoScan:
         # Alerts CSV and clips are named after the output video.
         self.name = name = self.output_path.stem.removesuffix("_tracked")
         self.alerts_csv = self.output_path.with_name(f"{name}_alerts.csv")
+        self.summary_json = self.output_path.with_name(f"{name}_summary.json")
         self.clips_dir = self.output_path.parent / "clips" / name
 
         self.tracker = ExamHallTracker(cfg)
@@ -536,6 +539,10 @@ class VideoScan:
         self.phone_detections = 0
         self.phones_assigned = 0
         self.seconds = 0.0
+        # For src/metrics.py: time per stage and people per frame.
+        self.timer = StageTimer()
+        self.max_people_in_frame = 0
+        self.person_frames = 0  # sum of people over processed frames
 
     def frames(self) -> Iterator[LiveFrame]:
         """Yield each processed frame as soon as it is ready."""
@@ -555,10 +562,13 @@ class VideoScan:
             for frame_index, timestamp, frame in read_video(
                 self.video_path, self.every_nth, self.cfg["runtime"]["fallback_fps"]
             ):
-                output = self.tracker.process_frame(frame_index, timestamp, frame)
-                new_alerts = self.risk.update(timestamp, output.records)
-                annotated = draw_frame(frame, output, self.cfg, flags=self.risk.active_flags())
-                writer.write(annotated)
+                with self.timer.time("models"):  # pose + tracking + phones + association
+                    output = self.tracker.process_frame(frame_index, timestamp, frame)
+                with self.timer.time("rules"):   # posture, cues, temporal logic, alerts
+                    new_alerts = self.risk.update(timestamp, output.records)
+                with self.timer.time("drawing"):  # blur, overlays, writing the video
+                    annotated = draw_frame(frame, output, self.cfg, flags=self.risk.active_flags())
+                    writer.write(annotated)
 
                 if clips is not None:
                     clips.add_frame(annotated, timestamp)
@@ -567,7 +577,10 @@ class VideoScan:
                 last_timestamp, last_annotated = timestamp, annotated
 
                 self.frames_processed += 1
+                self.timer.frames = self.frames_processed
                 self.track_ids.update(r.track_id for r in output.records)
+                self.max_people_in_frame = max(self.max_people_in_frame, len(output.records))
+                self.person_frames += len(output.records)
                 self.phone_detections += len(output.phones)
                 self.phones_assigned += sum(owner is not None for owner in output.assignments)
                 self.seconds = time.time() - start
@@ -591,6 +604,7 @@ class VideoScan:
             if clips is not None:
                 clips.close()
             save_alerts_csv(self.alerts, self.alerts_csv)
+            self.save_summary()
 
     def _finish_alert(self, alert: Alert, annotated: np.ndarray, clips: ClipRecorder | None) -> Alert:
         """Give a new alert its unique id, its review clip and, with
@@ -636,7 +650,19 @@ class VideoScan:
             "clips_dir": str(self.clips_dir),
             "seconds": self.seconds,
             "fps": self.frames_processed / self.seconds if self.seconds > 0 else 0.0,
+            # for src/metrics.py
+            "video_duration_s": self.info["frame_count"] / self.info["fps"] if self.info["fps"] else 0.0,
+            "max_people_in_frame": self.max_people_in_frame,
+            "mean_people_per_frame": self.person_frames / self.frames_processed if self.frames_processed else 0.0,
+            **{k: v for k, v in self.timer.summary().items() if k != "frames"},
         }
+
+    def save_summary(self) -> None:
+        """Write the summary (without the alert objects) to <video>_summary.json,
+        which `python -m src.metrics` reads for speed and people metrics."""
+        data = {k: v for k, v in self.summary().items() if k != "alerts"}
+        self.summary_json.parent.mkdir(parents=True, exist_ok=True)
+        self.summary_json.write_text(json.dumps(data, indent=2, default=str))
 
 
 def run_on_video(
@@ -671,6 +697,11 @@ def print_summary(summary: dict[str, Any]) -> None:
     print(f"  unassigned:      {summary['phones_unassigned']}")
     print(f"Wall time:         {summary['seconds']:.0f}s on {summary['device']} "
           f"({summary['fps']:.1f} processed frames/s, including any live display)")
+    if summary.get("ms_per_frame"):
+        stages = ", ".join(f"{k} {v:.0f} ms" for k, v in summary["ms_per_frame"].items())
+        print(f"Per frame:         {stages}")
+    print(f"People per frame:  max {summary.get('max_people_in_frame', 0)}, "
+          f"mean {summary.get('mean_people_per_frame', 0):.1f}")
     print(f"Annotated video:   {summary['output']}")
     grey = f", grey/cannot assess {summary['alerts_grey']}" if summary.get("alerts_grey") else ""
     print(f"\nFlags for HUMAN review: {len(summary['alerts'])} "

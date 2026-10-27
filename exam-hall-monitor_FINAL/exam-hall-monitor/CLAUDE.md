@@ -45,6 +45,8 @@ exam-hall-monitor/
     temporal.py      EventTracker: EMA + hysteresis + gap + min duration
     risk.py          FrameRecord -> Alert (timer or EventTracker, cues, grey
                      state, fusion, cooldown, evidence text, CSV + review decisions)
+    metrics.py       metrics without labels (run, alerts, review precision + Wilson CI),
+                     StageTimer used by VideoScan for ms per stage
   tests/             plain-assert tests; tests/helpers.py builds cfg + synthetic students
   app.py             Streamlit: live scan + review dashboard (Confirm / Dismiss)
   evaluate.py        event matching, sweep, ablation, per-condition, gallery, mode comparison
